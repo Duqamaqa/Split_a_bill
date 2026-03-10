@@ -1,4 +1,4 @@
 aiogram>=3,<4
-supabase>=2,<3
+psycopg[binary]>=3,<4
 pydantic-settings>=2,<3
 python-dotenv>=1,<2

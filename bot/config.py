@@ -11,10 +11,8 @@ from .currency import normalize_currency_code
 class Settings(BaseSettings):
     BOT_TOKEN: SecretStr = Field(..., min_length=10)
     BOT_USERNAME: str | None = Field(default=None)
-    SUPABASE_URL: str = Field(..., min_length=1)
-    SUPABASE_SERVICE_ROLE_KEY: SecretStr = Field(..., min_length=1)
+    DATABASE_URL: SecretStr = Field(..., min_length=1)
     DEFAULT_CURRENCY: str = Field(default="ILS", min_length=3, max_length=3)
-    REMIND_COOLDOWN_SECONDS: int = Field(default=43_200, ge=0)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -41,8 +39,8 @@ class Settings(BaseSettings):
         return self.BOT_TOKEN.get_secret_value()
 
     @property
-    def supabase_service_role_key(self) -> str:
-        return self.SUPABASE_SERVICE_ROLE_KEY.get_secret_value()
+    def database_url(self) -> str:
+        return self.DATABASE_URL.get_secret_value()
 
 
 @lru_cache(maxsize=1)

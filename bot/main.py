@@ -25,19 +25,8 @@ def configure_logging() -> None:
 
 
 async def set_bot_commands(bot: Bot) -> None:
-    """Register the command menu shown in Telegram clients."""
-    commands = [
-        BotCommand(command="start", description="Welcome and quick start"),
-        BotCommand(command="help", description="How to use Owee"),
-        BotCommand(command="in", description="Friend paid me (I owe)"),
-        BotCommand(command="out", description="I paid friend (friend owes)"),
-        BotCommand(command="setcurrency", description="Set my default currency"),
-        BotCommand(command="history", description="Recent transactions"),
-        BotCommand(command="balance", description="Balance with one friend"),
-        BotCommand(command="friends", description="All friends + balances"),
-        BotCommand(command="invite", description="Invite a friend"),
-        BotCommand(command="remind", description="Send debt reminder"),
-    ]
+    """Register the minimal command menu shown in Telegram clients."""
+    commands = [BotCommand(command="start", description="Open main menu")]
     await bot.set_my_commands(commands)
 
 
@@ -70,6 +59,7 @@ async def main() -> None:
         )
     finally:
         await bot.session.close()
+        database.close()
 
 
 if __name__ == "__main__":
