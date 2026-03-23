@@ -87,7 +87,6 @@ The Vercel entrypoint is `app.py`. It exposes:
 - `GET /api/health` for a database-backed health check
 
 Project files added for Vercel:
-- `vercel.json`
 - `.python-version`
 
 After deployment, set the Telegram webhook with:
