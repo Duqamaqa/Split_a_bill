@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import unittest
 
-from app import _is_valid_telegram_secret
 from bot.config import Settings
+from bot.webhook_app import is_valid_telegram_secret
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -11,6 +11,8 @@ def make_settings(**overrides: object) -> Settings:
         "BOT_TOKEN": "1234567890:TESTTOKEN",
         "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/split_bill",
         "DEFAULT_CURRENCY": "ILS",
+        "WEBHOOK_SECRET": None,
+        "PUBLIC_BASE_URL": None,
     }
     values.update(overrides)
     return Settings(**values)
@@ -34,14 +36,14 @@ class WebhookConfigTest(unittest.TestCase):
 
     def test_webhook_secret_is_optional(self) -> None:
         settings = make_settings()
-        self.assertTrue(_is_valid_telegram_secret(settings, None))
-        self.assertTrue(_is_valid_telegram_secret(settings, "anything"))
+        self.assertTrue(is_valid_telegram_secret(settings, None))
+        self.assertTrue(is_valid_telegram_secret(settings, "anything"))
 
     def test_webhook_secret_must_match_header(self) -> None:
         settings = make_settings(WEBHOOK_SECRET="super-secret")
-        self.assertTrue(_is_valid_telegram_secret(settings, "super-secret"))
-        self.assertFalse(_is_valid_telegram_secret(settings, None))
-        self.assertFalse(_is_valid_telegram_secret(settings, "wrong-secret"))
+        self.assertTrue(is_valid_telegram_secret(settings, "super-secret"))
+        self.assertFalse(is_valid_telegram_secret(settings, None))
+        self.assertFalse(is_valid_telegram_secret(settings, "wrong-secret"))
 
 
 if __name__ == "__main__":

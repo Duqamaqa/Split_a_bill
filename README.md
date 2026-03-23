@@ -82,11 +82,13 @@ python -m bot.main
 
 ## Vercel deployment
 
-The Vercel entrypoint is `app.py`. It exposes:
+The Vercel Python function entrypoint is `api/index.py`.
+It exposes:
 - `POST /api/telegram` for Telegram webhooks
 - `GET /api/health` for a database-backed health check
 
 Project files added for Vercel:
+- `api/index.py`
 - `.python-version`
 
 After deployment, set the Telegram webhook with:
