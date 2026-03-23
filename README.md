@@ -1,109 +1,103 @@
-# Split a Bill Telegram Bot (aiogram v3 + Supabase)
+# Split a Bill Telegram Bot
 
-Telegram debt-sharing bot built with:
-- aiogram v3 (long polling)
-- supabase-py
+Minimal Telegram debt bot with exactly 3 user actions:
+- `In`
+- `Balance`
+- `Close`
+
+Tech stack:
+- aiogram v3
+- FastAPI webhook entrypoint for Vercel
+- PostgreSQL (direct via psycopg)
 - pydantic-settings
+
+## How it works
+
+1. User taps `In`.
+2. Bot asks for amount (`120` or `120 USD`).
+3. Bot creates a deep link like `https://t.me/<BOT_USERNAME>?start=pay_<CODE>`.
+4. User taps `Forward Loan` and sends it to the person who gave the money.
+5. That person opens the link and taps `Approve`.
+6. Bot writes a confirmed transaction to PostgreSQL.
+
+`Balance` shows only non-zero debts.
+
+`Close` shows people with open debts as buttons. Tapping a person sets your mutual balances to `0`.
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 - `pip`
+- PostgreSQL 14+
 
-## Project Structure
+## Local setup
 
-```text
-bot/
-  __init__.py
-  main.py
-  config.py
-  currency.py
-  db.py
-  models.py
-  logic.py
-  handlers/
-    __init__.py
-    start.py
-    invite.py
-    ledger.py
-    remind.py
-    callbacks.py
-  middlewares/
-    __init__.py
-    idempotency.py
-  utils/
-    __init__.py
-    formatting.py
-    rate_limit.py
-requirements.txt
-.env.example
-supabase/schema.sql
-supabase/migrations/20260305_multi_currency.sql
-tests/
-README.md
+1. Open terminal in the project:
+
+```bash
+cd /Users/coconut/Documents/projects/Split_a_bill
 ```
 
-## Setup
+2. Create and activate a virtual environment:
 
-1. Copy the env template:
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+```
+
+3. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+4. Create env file:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Fill `.env`:
+5. Fill `.env`:
 
 ```env
 BOT_TOKEN=<telegram-bot-token>
-BOT_USERNAME=<your_bot_username_without_@>
-SUPABASE_URL=<https://your-project.supabase.co>
-SUPABASE_SERVICE_ROLE_KEY=<your-service-role-key>
+BOT_USERNAME=<bot_username_without_@>
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/split_bill
 DEFAULT_CURRENCY=ILS
-REMIND_COOLDOWN_SECONDS=43200
+WEBHOOK_SECRET=<random-secret-string>
+PUBLIC_BASE_URL=https://your-project.vercel.app
 ```
 
-3. Run:
+6. Run SQL in PostgreSQL:
+
+- `postgres/schema.sql`
+- If you already have old tables and only need request-links feature:
+  - `postgres/migrations/20260306_payment_requests.sql`
+
+7. Optional local polling mode for development:
 
 ```bash
-pip install -r requirements.txt
 python -m bot.main
 ```
 
-## Multi-Currency
+## Vercel deployment
 
-Supported currencies: `ILS`, `USD`, `EUR`, `RUB`.
+The Vercel entrypoint is `app.py`. It exposes:
+- `POST /api/telegram` for Telegram webhooks
+- `GET /api/health` for a database-backed health check
 
-Examples:
+Project files added for Vercel:
+- `vercel.json`
+- `.python-version`
 
-- `/setcurrency RUB`
-- `/out` (friend picker buttons, then send amount)
-- `/in` (friend picker buttons, then send amount)
-- `/balance` (friend picker buttons)
-- `/history` (friend picker buttons)
-- `/remind` (friend picker buttons)
-- `/out @friend 100`
-- `/out @friend 100 usd`
-- `/out @friend 100 USD dinner`
-- `/out` is recorded immediately (friend receives info message, no confirm/reject)
-- `/balance @friend`
-- `/balance @friend RUB`
-- `/remind @friend`
-- `/remind @friend EUR`
+After deployment, set the Telegram webhook with:
 
-## Sanity Checklist
+```bash
+python -m bot.setup_webhook
+```
 
-- Create a bot token in BotFather and put it in `BOT_TOKEN`.
-- Set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
-- Run the SQL schema from `supabase/schema.sql` in Supabase SQL Editor.
-- Run migration SQL: `supabase/migrations/20260305_multi_currency.sql`.
-- Set `BOT_USERNAME` (without `@`) to match your bot.
-- Test invite acceptance via deep-link (`/invite @friend`, then open `https://t.me/<BOT_USERNAME>?start=inv_<code>`).
-- Test `/setcurrency RUB`, then `/out @friend 100` (should use RUB by default).
-- Test `/out` confirmation flow (counterparty gets confirm/reject buttons).
-- Test `/friends` balance output.
-- Test `/remind` cooldown per currency (second reminder in the same currency should be blocked).
+This command uses `PUBLIC_BASE_URL` and `WEBHOOK_SECRET` from your environment and registers the webhook URL `https://<your-domain>/api/telegram`.
 
-## Notes
+## Database note
 
-- `SUPABASE_SERVICE_ROLE_KEY` is sensitive and must stay server-side.
-- Run the bot in a private backend environment; never expose env values in client code.
+This version requires table `payment_requests` and `processed_updates` from `postgres/schema.sql`.

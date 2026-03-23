@@ -14,9 +14,6 @@ logger = logging.getLogger(__name__)
 class UpdateIdempotencyMiddleware(BaseMiddleware):
     """Skip duplicate Telegram updates based on `update_id` persistence."""
 
-    def __init__(self, db: Database) -> None:
-        self._db = db
-
     async def __call__(
         self,
         handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
@@ -26,10 +23,14 @@ class UpdateIdempotencyMiddleware(BaseMiddleware):
         if not isinstance(event, Update):
             return await handler(event, data)
 
+        db = data.get("db")
+        if not isinstance(db, Database):
+            return await handler(event, data)
+
         update_id = int(event.update_id)
 
         try:
-            already_processed = self._db.is_update_processed(update_id)
+            already_processed = db.is_update_processed(update_id)
         except Exception:
             logger.exception("Failed idempotency check for update_id=%s", update_id)
             return await handler(event, data)
@@ -41,7 +42,7 @@ class UpdateIdempotencyMiddleware(BaseMiddleware):
         result = await handler(event, data)
 
         try:
-            marked = self._db.mark_update_processed(update_id)
+            marked = db.mark_update_processed(update_id)
             if not marked:
                 logger.info("update_id=%s was marked concurrently", update_id)
         except Exception:

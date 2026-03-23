@@ -11,10 +11,10 @@ from .currency import normalize_currency_code
 class Settings(BaseSettings):
     BOT_TOKEN: SecretStr = Field(..., min_length=10)
     BOT_USERNAME: str | None = Field(default=None)
-    SUPABASE_URL: str = Field(..., min_length=1)
-    SUPABASE_SERVICE_ROLE_KEY: SecretStr = Field(..., min_length=1)
+    DATABASE_URL: SecretStr = Field(..., min_length=1)
     DEFAULT_CURRENCY: str = Field(default="ILS", min_length=3, max_length=3)
-    REMIND_COOLDOWN_SECONDS: int = Field(default=43_200, ge=0)
+    WEBHOOK_SECRET: SecretStr | None = Field(default=None, min_length=1)
+    PUBLIC_BASE_URL: str | None = Field(default=None)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -36,13 +36,44 @@ class Settings(BaseSettings):
         normalized = value.strip().lstrip("@")
         return normalized or None
 
+    @field_validator("PUBLIC_BASE_URL")
+    @classmethod
+    def _normalize_public_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+
+        normalized = value.strip().rstrip("/")
+        if not normalized:
+            return None
+
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("PUBLIC_BASE_URL must start with http:// or https://")
+
+        return normalized
+
     @property
     def bot_token(self) -> str:
         return self.BOT_TOKEN.get_secret_value()
 
     @property
-    def supabase_service_role_key(self) -> str:
-        return self.SUPABASE_SERVICE_ROLE_KEY.get_secret_value()
+    def database_url(self) -> str:
+        return self.DATABASE_URL.get_secret_value()
+
+    @property
+    def webhook_secret(self) -> str | None:
+        if self.WEBHOOK_SECRET is None:
+            return None
+        return self.WEBHOOK_SECRET.get_secret_value()
+
+    @property
+    def public_base_url(self) -> str | None:
+        return self.PUBLIC_BASE_URL
+
+    @property
+    def telegram_webhook_url(self) -> str:
+        if not self.PUBLIC_BASE_URL:
+            raise RuntimeError("PUBLIC_BASE_URL is required to build the Telegram webhook URL")
+        return f"{self.PUBLIC_BASE_URL}/api/telegram"
 
 
 @lru_cache(maxsize=1)

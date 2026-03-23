@@ -1,64 +1,49 @@
 from __future__ import annotations
 
 import logging
-import re
 import secrets
 import string
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 from uuid import UUID
 
-from supabase import Client, create_client
+import psycopg
+from psycopg.rows import dict_row
 
 from .config import Settings
 from .currency import normalize_currency_code
-from .models import FriendRecord, LedgerEntry
-
-try:
-    from postgrest.exceptions import APIError
-except Exception:  # pragma: no cover - fallback for import compatibility
-    APIError = Exception  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
-_INVITE_CODE_ALPHABET = string.ascii_uppercase + string.digits
-_INVITE_CODE_LENGTH = 10
-_DEFAULT_INVITE_TTL = timedelta(days=7)
+_CODE_ALPHABET = string.ascii_uppercase + string.digits
+_CODE_LENGTH = 10
 _TWO_DP = Decimal("0.01")
-_ZERO = Decimal("0")
+_ZERO = Decimal("0.00")
 
 
 class Database:
     def __init__(self, settings: Settings) -> None:
-        self._client: Client = create_client(
-            settings.SUPABASE_URL,
-            settings.supabase_service_role_key,
+        self._conn = psycopg.connect(
+            conninfo=settings.database_url,
+            autocommit=True,
+            row_factory=dict_row,
         )
         self._processed_updates_missing_logged = False
 
-    @property
-    def client(self) -> Client:
-        return self._client
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            logger.exception("Failed to close PostgreSQL connection")
 
     def assert_ready(self) -> None:
-        """Fail fast when Supabase credentials/schema are not usable."""
+        """Fail fast when PostgreSQL credentials/schema are not usable."""
         try:
-            self._client.table("profiles").select("id").limit(1).execute()
-        except APIError as exc:  # type: ignore[misc]
-            message = _extract_api_error_message(exc)
-            combined_error = f"{message} | {exc}".lower()
-            if "invalid api key" in combined_error:
-                raise RuntimeError(
-                    "Supabase rejected SUPABASE_SERVICE_ROLE_KEY for SUPABASE_URL. "
-                    "Use the service_role key from the same Supabase project "
-                    "(Dashboard -> Settings -> API) and restart the bot."
-                ) from exc
-            raise RuntimeError(
-                f"Supabase connectivity check failed: {message}"
-            ) from exc
+            with self._conn.cursor() as cur:
+                cur.execute("select 1 from public.profiles limit 1")
+                cur.execute("select 1 from public.payment_requests limit 1")
         except Exception as exc:
-            raise RuntimeError(f"Supabase connectivity check failed: {exc}") from exc
+            raise RuntimeError(f"PostgreSQL connectivity check failed: {exc}") from exc
 
     # ---------- Profiles ----------
     def get_or_create_profile(
@@ -67,465 +52,398 @@ class Database:
         username: str | None,
         display_name: str | None,
     ) -> dict[str, Any]:
-        payload = {
-            "telegram_user_id": int(telegram_user_id),
-            "telegram_username": _normalize_username(username),
-            "display_name": _normalize_text(display_name),
-        }
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into public.profiles (
+                    telegram_user_id,
+                    telegram_username,
+                    display_name
+                )
+                values (%s, %s, %s)
+                on conflict (telegram_user_id)
+                do update set
+                    telegram_username = excluded.telegram_username,
+                    display_name = excluded.display_name
+                returning *
+                """,
+                (
+                    int(telegram_user_id),
+                    _normalize_username(username),
+                    _normalize_text(display_name),
+                ),
+            )
+            row = _fetchone_row(cur)
 
-        self._client.table("profiles").upsert(
-            payload,
-            on_conflict="telegram_user_id",
-        ).execute()
-
-        profile = self._get_profile_by_telegram_user_id(int(telegram_user_id))
-        if profile is None:
+        if row is None:
             raise RuntimeError("Failed to create or fetch profile")
-        return profile
+        return row
 
-    def get_profile_by_username(self, username: str | None) -> dict[str, Any] | None:
-        normalized = _normalize_username(username)
-        if normalized is None:
-            return None
+    def get_profile_by_id(self, profile_id: str) -> dict[str, Any] | None:
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    id,
+                    telegram_user_id,
+                    telegram_username,
+                    display_name,
+                    default_currency
+                from public.profiles
+                where id = %s::uuid
+                limit 1
+                """,
+                (_normalize_uuid(profile_id),),
+            )
+            return _fetchone_row(cur)
 
-        exact = (
-            self._client.table("profiles")
-            .select("*")
-            .eq("telegram_username", normalized)
-            .limit(1)
-            .execute()
-        )
-        row = _first_row(exact.data)
-        if row is not None:
-            return row
-
-        # Best-effort case-insensitive lookup when exact match is unknown.
-        insensitive = (
-            self._client.table("profiles")
-            .select("*")
-            .ilike("telegram_username", normalized)
-            .limit(1)
-            .execute()
-        )
-        return _first_row(insensitive.data)
-
-    def set_profile_default_currency(
+    # ---------- Requests ----------
+    def create_payment_request(
         self,
-        profile_id: str,
+        requester_id: str,
+        amount: Decimal | str | int | float,
         currency: str,
-    ) -> dict[str, Any] | None:
-        response = (
-            self._client.table("profiles")
-            .update({"default_currency": _normalize_currency(currency)})
-            .eq("id", _normalize_uuid(profile_id))
-            .execute()
-        )
-        return _first_row(response.data)
-
-    # ---------- Invites ----------
-    def create_invite(self, inviter_id: str, invitee_username: str | None) -> dict[str, Any]:
-        inviter_id = _normalize_uuid(inviter_id)
-        normalized_username = _normalize_username(invitee_username)
-        expires_at = (datetime.now(timezone.utc) + _DEFAULT_INVITE_TTL).isoformat()
+    ) -> dict[str, Any]:
+        requester_id = _normalize_uuid(requester_id)
+        normalized_amount = _normalize_amount(amount)
+        normalized_currency = normalize_currency_code(currency)
 
         for _ in range(8):
-            code = _generate_invite_code()
-            payload = {
-                "code": code,
-                "inviter": inviter_id,
-                "invitee_username": normalized_username,
-                "status": "pending",
-                "expires_at": expires_at,
-            }
+            code = _generate_code()
             try:
-                response = self._client.table("invites").insert(payload).execute()
-            except APIError as exc:  # type: ignore[misc]
+                with self._conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        insert into public.payment_requests (
+                            code,
+                            requester_id,
+                            amount,
+                            currency,
+                            status,
+                            approved_by,
+                            approved_at,
+                            friendship_id,
+                            transaction_id
+                        )
+                        values (%s, %s::uuid, %s, %s, 'pending', null, null, null, null)
+                        returning *
+                        """,
+                        (
+                            code,
+                            requester_id,
+                            _decimal_to_str(normalized_amount),
+                            normalized_currency,
+                        ),
+                    )
+                    row = _fetchone_row(cur)
+            except Exception as exc:
                 if _is_unique_violation(exc):
                     continue
                 raise
 
-            row = _first_row(response.data)
             if row is not None:
                 return row
 
-        raise RuntimeError("Unable to create a unique invite code")
+        raise RuntimeError("Unable to create a unique payment request code")
 
-    def get_invite_by_code(self, code: str) -> dict[str, Any] | None:
-        normalized_code = code.strip()
+    def get_payment_request_by_code(self, code: str) -> dict[str, Any] | None:
+        normalized_code = code.strip().upper()
         if not normalized_code:
             return None
 
-        response = (
-            self._client.table("invites")
-            .select("*")
-            .eq("code", normalized_code)
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                select *
+                from public.payment_requests
+                where code = %s
+                limit 1
+                """,
+                (normalized_code,),
+            )
+            return _fetchone_row(cur)
 
-    # ---------- Friendships ----------
-    def create_or_get_friendship(self, inviter_id: str, invitee_id: str) -> dict[str, Any]:
-        inviter_id = _normalize_uuid(inviter_id)
-        invitee_id = _normalize_uuid(invitee_id)
-
-        if inviter_id == invitee_id:
-            raise ValueError("Cannot create friendship with the same profile")
-
-        user_low, user_high = _canonical_pair(inviter_id, invitee_id)
-
-        existing = self._get_friendship_by_pair(user_low, user_high)
-        if existing is not None:
-            return existing
-
-        payload = {
-            "user_low": user_low,
-            "user_high": user_high,
-            "invited_by": inviter_id,
-            "status": "pending",
-            "accepted_at": None,
-        }
-
-        try:
-            response = self._client.table("friendships").insert(payload).execute()
-            row = _first_row(response.data)
-            if row is not None:
-                return row
-        except APIError as exc:  # type: ignore[misc]
-            if not _is_unique_violation(exc):
-                raise
-
-        # Race-safe fallback.
-        existing = self._get_friendship_by_pair(user_low, user_high)
-        if existing is None:
-            raise RuntimeError("Failed to create or fetch friendship")
-        return existing
-
-    def set_friendship_status(
+    def approve_payment_request(
         self,
-        friendship_id: str,
-        status: str,
-        accepted_at: datetime | str | None = None,
-    ) -> dict[str, Any] | None:
-        status = status.strip().lower()
-        allowed = {"pending", "accepted", "declined", "blocked"}
-        if status not in allowed:
-            raise ValueError(f"Unsupported friendship status: {status}")
+        code: str,
+        approver_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+        """
+        Approve a pending payment request and write a confirmed transaction.
 
-        payload: dict[str, Any] = {"status": status}
-        if status == "accepted":
-            payload["accepted_at"] = _to_iso_datetime(accepted_at)
-        else:
-            payload["accepted_at"] = None
+        Returns: (request_row, transaction_row_or_none, changed)
+          * changed=True: this call approved and wrote the transaction
+          * changed=False: request was already approved before this call
 
-        response = (
-            self._client.table("friendships")
-            .update(payload)
-            .eq("id", _normalize_uuid(friendship_id))
-            .execute()
-        )
-        return _first_row(response.data)
+        Raises ValueError with one of:
+          REQUEST_NOT_FOUND
+          REQUEST_SELF_APPROVAL
+          REQUEST_NOT_PENDING
+          REQUEST_PROCESSING
+        """
+        normalized_code = code.strip().upper()
+        if not normalized_code:
+            raise ValueError("REQUEST_NOT_FOUND")
 
-    def list_friends(self, user_id: str) -> list[dict[str, Any]]:
-        normalized_user_id = _normalize_uuid(user_id)
+        approver_id = _normalize_uuid(approver_id)
 
-        friendships = self._list_friendships_for_user(normalized_user_id)
-        if not friendships:
-            return []
+        with self._conn.transaction():
+            with self._conn.cursor() as cur:
+                request_row = self._get_payment_request_by_code_tx(
+                    cur,
+                    normalized_code,
+                    for_update=True,
+                )
+                if request_row is None:
+                    raise ValueError("REQUEST_NOT_FOUND")
 
-        friend_ids: set[str] = set()
-        friendship_ids: list[str] = []
-        for friendship in friendships:
-            friendship_id = str(friendship.get("id", ""))
-            if friendship_id:
-                friendship_ids.append(friendship_id)
+                requester_id = str(request_row.get("requester_id", ""))
+                if requester_id == approver_id:
+                    raise ValueError("REQUEST_SELF_APPROVAL")
 
-            user_low = str(friendship.get("user_low", ""))
-            user_high = str(friendship.get("user_high", ""))
-            friend_id = user_high if user_low == normalized_user_id else user_low
-            if friend_id:
-                friend_ids.add(friend_id)
+                status = str(request_row.get("status", "")).lower()
+                if status == "approved":
+                    existing_tx = self._get_transaction_by_id_tx(
+                        cur,
+                        str(request_row.get("transaction_id", "")),
+                    )
+                    return request_row, existing_tx, False
 
-        profiles_by_id = self._get_profiles_by_id(friend_ids)
-        balances_by_friendship = self._get_balances_by_friendship(friendship_ids)
+                if status == "processing":
+                    raise ValueError("REQUEST_PROCESSING")
 
-        results: list[dict[str, Any]] = []
-        for friendship in friendships:
-            friendship_id = str(friendship.get("id", ""))
-            user_low = str(friendship.get("user_low", ""))
-            user_high = str(friendship.get("user_high", ""))
-            friend_id = user_high if user_low == normalized_user_id else user_low
-            friend_profile = profiles_by_id.get(friend_id)
-            balance_rows = balances_by_friendship.get(friendship_id, [])
+                if status != "pending":
+                    raise ValueError("REQUEST_NOT_PENDING")
 
-            per_currency: list[dict[str, Any]] = []
-            for balance_row in balance_rows:
-                raw_net = _to_decimal(balance_row.get("net_amount"))
-                # Positive perspective means friend owes current user.
-                perspective = raw_net if user_low == normalized_user_id else -raw_net
+                request_id = str(request_row.get("id", ""))
+                if not request_id:
+                    raise RuntimeError("Payment request ID is missing")
 
-                per_currency.append(
-                    {
-                        "currency": str(balance_row.get("currency", "")).upper(),
-                        "net_amount": _decimal_to_str(raw_net),
-                        "they_owe_you": _decimal_to_str(max(perspective, _ZERO)),
-                        "you_owe": _decimal_to_str(max(-perspective, _ZERO)),
-                    }
+                cur.execute(
+                    """
+                    update public.payment_requests
+                    set
+                        status = 'processing',
+                        approved_by = %s::uuid,
+                        approved_at = now()
+                    where id = %s::uuid
+                      and status = 'pending'
+                    returning *
+                    """,
+                    (approver_id, request_id),
+                )
+                locked_row = _fetchone_row(cur)
+                if locked_row is None:
+                    latest = self._get_payment_request_by_code_tx(cur, normalized_code)
+                    if latest is None:
+                        raise ValueError("REQUEST_NOT_FOUND")
+                    latest_status = str(latest.get("status", "")).lower()
+                    if latest_status == "approved":
+                        existing_tx = self._get_transaction_by_id_tx(
+                            cur,
+                            str(latest.get("transaction_id", "")),
+                        )
+                        return latest, existing_tx, False
+                    if latest_status == "processing":
+                        raise ValueError("REQUEST_PROCESSING")
+                    raise ValueError("REQUEST_NOT_PENDING")
+
+                amount = _to_decimal(locked_row.get("amount"))
+                currency = str(locked_row.get("currency", "")).upper()
+
+                friendship = self._ensure_accepted_friendship_tx(
+                    cur,
+                    left_id=requester_id,
+                    right_id=approver_id,
+                    invited_by=requester_id,
+                )
+                friendship_id = str(friendship.get("id", ""))
+                if not friendship_id:
+                    raise RuntimeError("Friendship ID is missing")
+
+                tx = self._create_confirmed_transaction_tx(
+                    cur,
+                    friendship=friendship,
+                    friendship_id=friendship_id,
+                    created_by=requester_id,
+                    direction="in",
+                    amount=amount,
+                    currency=currency,
+                    confirmed_by=approver_id,
+                    note=f"Approved via request code {normalized_code}",
                 )
 
-            results.append(
-                {
+                cur.execute(
+                    """
+                    update public.payment_requests
+                    set
+                        status = 'approved',
+                        approved_by = %s::uuid,
+                        approved_at = now(),
+                        friendship_id = %s::uuid,
+                        transaction_id = %s::uuid
+                    where id = %s::uuid
+                      and status = 'processing'
+                    returning *
+                    """,
+                    (
+                        approver_id,
+                        friendship_id,
+                        str(tx.get("id", "")),
+                        request_id,
+                    ),
+                )
+                final_row = _fetchone_row(cur)
+                if final_row is None:
+                    raise RuntimeError("Failed to finalize payment request")
+
+                return final_row, tx, True
+
+    # ---------- Balance Views ----------
+    def list_open_balances(self, viewer_id: str) -> list[dict[str, Any]]:
+        viewer_id = _normalize_uuid(viewer_id)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                    f.id::text as friendship_id,
+                    f.user_low::text as user_low,
+                    f.user_high::text as user_high,
+                    p.id::text as friend_id,
+                    p.telegram_user_id,
+                    p.telegram_username,
+                    p.display_name,
+                    b.currency,
+                    b.net_amount
+                from public.friendships f
+                join public.balances b
+                  on b.friendship_id = f.id
+                 and b.net_amount <> 0
+                join public.profiles p
+                  on p.id = case
+                        when f.user_low = %s::uuid then f.user_high
+                        else f.user_low
+                    end
+                where f.status = 'accepted'
+                  and (f.user_low = %s::uuid or f.user_high = %s::uuid)
+                order by
+                    lower(coalesce(p.display_name, p.telegram_username, p.id::text)),
+                    b.currency
+                """,
+                (viewer_id, viewer_id, viewer_id),
+            )
+            rows = _fetchall_rows(cur)
+
+        by_friendship: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            friendship_id = str(row.get("friendship_id", ""))
+            if not friendship_id:
+                continue
+
+            friend_id = str(row.get("friend_id", ""))
+            if not friend_id:
+                continue
+
+            item = by_friendship.get(friendship_id)
+            if item is None:
+                item = {
                     "friendship_id": friendship_id,
-                    "friend_profile": friend_profile,
-                    "balance": per_currency,
+                    "friend_profile": {
+                        "id": friend_id,
+                        "telegram_user_id": row.get("telegram_user_id"),
+                        "telegram_username": row.get("telegram_username"),
+                        "display_name": row.get("display_name"),
+                    },
+                    "open_rows": [],
+                }
+                by_friendship[friendship_id] = item
+
+            user_low = str(row.get("user_low", ""))
+            user_high = str(row.get("user_high", ""))
+            net_amount = _to_decimal(row.get("net_amount"))
+
+            if viewer_id == user_low:
+                they_owe_you = max(net_amount, _ZERO)
+                you_owe = max(-net_amount, _ZERO)
+            elif viewer_id == user_high:
+                they_owe_you = max(-net_amount, _ZERO)
+                you_owe = max(net_amount, _ZERO)
+            else:
+                continue
+
+            if they_owe_you == _ZERO and you_owe == _ZERO:
+                continue
+
+            item["open_rows"].append(
+                {
+                    "currency": str(row.get("currency", "")).upper(),
+                    "they_owe_you": they_owe_you,
+                    "you_owe": you_owe,
                 }
             )
 
+        results: list[dict[str, Any]] = []
+        for item in by_friendship.values():
+            open_rows = item.get("open_rows", [])
+            open_rows.sort(key=lambda entry: str(entry.get("currency", "")))
+            if open_rows:
+                results.append(item)
+
         return results
 
-    # ---------- Transactions ----------
-    def create_pending_transaction(
-        self,
-        friendship_id: str,
-        created_by: str,
-        direction: str,
-        amount: Decimal | str | int | float,
-        currency: str,
-        note: str | None,
-    ) -> dict[str, Any]:
-        friendship_id = _normalize_uuid(friendship_id)
-        created_by = _normalize_uuid(created_by)
+    def close_friend_balances(self, viewer_id: str, friend_id: str) -> list[str]:
+        viewer_id = _normalize_uuid(viewer_id)
+        friend_id = _normalize_uuid(friend_id)
 
-        direction = direction.strip().lower()
-        if direction not in {"in", "out"}:
-            raise ValueError("Direction must be 'in' or 'out'")
+        user_low, user_high = _canonical_pair(viewer_id, friend_id)
 
-        normalized_amount = _normalize_amount(amount)
-        normalized_currency = _normalize_currency(currency)
-
-        friendship = self._get_friendship_by_id(friendship_id)
-        if friendship is None:
-            raise ValueError("Friendship does not exist")
-
-        members = {
-            str(friendship.get("user_low", "")),
-            str(friendship.get("user_high", "")),
-        }
-        if created_by not in members:
-            raise ValueError("Transaction creator must belong to the friendship")
-
-        payload = {
-            "friendship_id": friendship_id,
-            "created_by": created_by,
-            "direction": direction,
-            "amount": _decimal_to_str(normalized_amount),
-            "currency": normalized_currency,
-            "note": _normalize_text(note),
-            "status": "pending",
-        }
-
-        response = self._client.table("transactions").insert(payload).execute()
-        row = _first_row(response.data)
-        if row is None:
-            raise RuntimeError("Failed to create pending transaction")
-        return row
-
-    def create_confirmed_transaction(
-        self,
-        friendship_id: str,
-        created_by: str,
-        direction: str,
-        amount: Decimal | str | int | float,
-        currency: str,
-        note: str | None,
-    ) -> dict[str, Any]:
-        """
-        Create an immediately confirmed transaction and apply its balance effect.
-        """
-        friendship_id = _normalize_uuid(friendship_id)
-        created_by = _normalize_uuid(created_by)
-
-        direction = direction.strip().lower()
-        if direction not in {"in", "out"}:
-            raise ValueError("Direction must be 'in' or 'out'")
-
-        normalized_amount = _normalize_amount(amount)
-        normalized_currency = _normalize_currency(currency)
-
-        friendship = self._get_friendship_by_id(friendship_id)
-        if friendship is None:
-            raise ValueError("Friendship does not exist")
-
-        members = {
-            str(friendship.get("user_low", "")),
-            str(friendship.get("user_high", "")),
-        }
-        if created_by not in members:
-            raise ValueError("Transaction creator must belong to the friendship")
-
-        payload = {
-            "friendship_id": friendship_id,
-            "created_by": created_by,
-            "direction": direction,
-            "amount": _decimal_to_str(normalized_amount),
-            "currency": normalized_currency,
-            "note": _normalize_text(note),
-            "status": "confirmed",
-            "confirmed_by": created_by,
-            "confirmed_at": _now_utc_iso(),
-            "rejected_at": None,
-            "reversed_at": None,
-            "reverses_transaction_id": None,
-        }
-
-        response = self._client.table("transactions").insert(payload).execute()
-        row = _first_row(response.data)
-        if row is None:
-            raise RuntimeError("Failed to create confirmed transaction")
-
-        delta = _transaction_effect_on_net(tx=row, friendship=friendship)
-        balance_row = self._apply_balance_delta(
-            friendship_id=str(row["friendship_id"]),
-            currency=str(row["currency"]),
-            delta=delta,
-        )
-        if balance_row is not None:
-            row["net_amount_after"] = balance_row.get("net_amount")
-        return row
-
-    def confirm_transaction(self, tx_id: str, confirmer_user_id: str) -> dict[str, Any] | None:
-        tx_id = _normalize_uuid(tx_id)
-        confirmer_user_id = _normalize_uuid(confirmer_user_id)
-
-        tx = self._get_transaction_by_id(tx_id)
-        if tx is None:
-            return None
-
-        current_status = str(tx.get("status", "")).lower()
-        if current_status == "confirmed":
-            # Safe retry path when previous attempt confirmed tx but failed before balance write.
-            self._recompute_and_upsert_balance(str(tx["friendship_id"]), str(tx["currency"]))
-            return tx
-
-        if current_status != "pending":
-            return tx
-
-        friendship = self._get_friendship_by_id(str(tx["friendship_id"]))
-        if friendship is None:
-            raise ValueError("Friendship for transaction was not found")
-
-        _validate_tx_reviewer(
-            friendship=friendship,
-            tx_created_by=str(tx.get("created_by", "")),
-            reviewer_id=confirmer_user_id,
-        )
-
-        payload = {
-            "status": "confirmed",
-            "confirmed_by": confirmer_user_id,
-            "confirmed_at": _now_utc_iso(),
-            "rejected_at": None,
-            "reversed_at": None,
-            "reverses_transaction_id": None,
-        }
-
-        # Compare-and-set: only transition pending -> confirmed.
-        response = (
-            self._client.table("transactions")
-            .update(payload)
-            .eq("id", tx_id)
-            .eq("status", "pending")
-            .execute()
-        )
-
-        updated = _first_row(response.data)
-        if updated is None:
-            latest = self._get_transaction_by_id(tx_id)
-            if latest is not None and str(latest.get("status", "")).lower() == "confirmed":
-                self._recompute_and_upsert_balance(
-                    str(latest["friendship_id"]),
-                    str(latest["currency"]),
+        with self._conn.transaction():
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select id, status
+                    from public.friendships
+                    where user_low = %s::uuid
+                      and user_high = %s::uuid
+                    limit 1
+                    """,
+                    (user_low, user_high),
                 )
-            return latest
+                friendship = _fetchone_row(cur)
+                if friendship is None or str(friendship.get("status", "")).lower() != "accepted":
+                    raise ValueError("FRIENDSHIP_NOT_FOUND")
 
-        delta = _transaction_effect_on_net(tx=updated, friendship=friendship)
-        balance_row = self._apply_balance_delta(
-            friendship_id=str(updated["friendship_id"]),
-            currency=str(updated["currency"]),
-            delta=delta,
-        )
-        if balance_row is not None:
-            updated["net_amount_after"] = balance_row.get("net_amount")
-        return updated
+                friendship_id = str(friendship.get("id", ""))
+                if not friendship_id:
+                    raise RuntimeError("Friendship ID is missing")
 
-    def reject_transaction(self, tx_id: str, confirmer_user_id: str) -> dict[str, Any] | None:
-        tx_id = _normalize_uuid(tx_id)
-        confirmer_user_id = _normalize_uuid(confirmer_user_id)
+                cur.execute(
+                    """
+                    update public.balances
+                    set net_amount = 0
+                    where friendship_id = %s::uuid
+                      and net_amount <> 0
+                    returning currency
+                    """,
+                    (friendship_id,),
+                )
+                rows = _fetchall_rows(cur)
 
-        tx = self._get_transaction_by_id(tx_id)
-        if tx is None:
-            return None
-
-        current_status = str(tx.get("status", "")).lower()
-        if current_status == "rejected":
-            return tx
-
-        if current_status != "pending":
-            return tx
-
-        friendship = self._get_friendship_by_id(str(tx["friendship_id"]))
-        if friendship is None:
-            raise ValueError("Friendship for transaction was not found")
-
-        _validate_tx_reviewer(
-            friendship=friendship,
-            tx_created_by=str(tx.get("created_by", "")),
-            reviewer_id=confirmer_user_id,
-        )
-
-        payload = {
-            "status": "rejected",
-            "confirmed_by": None,
-            "confirmed_at": None,
-            "rejected_at": _now_utc_iso(),
-            "reversed_at": None,
-            "reverses_transaction_id": None,
-        }
-
-        response = (
-            self._client.table("transactions")
-            .update(payload)
-            .eq("id", tx_id)
-            .eq("status", "pending")
-            .execute()
-        )
-        updated = _first_row(response.data)
-        if updated is not None:
-            return updated
-
-        return self._get_transaction_by_id(tx_id)
-
-    def list_transactions(self, friendship_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        safe_limit = max(1, min(int(limit), 200))
-        response = (
-            self._client.table("transactions")
-            .select("*")
-            .eq("friendship_id", _normalize_uuid(friendship_id))
-            .order("created_at", desc=True)
-            .limit(safe_limit)
-            .execute()
-        )
-        return _rows(response.data)
+        closed = sorted(str(row.get("currency", "")).upper() for row in rows if row.get("currency"))
+        return closed
 
     # ---------- Telegram update idempotency ----------
     def mark_update_processed(self, update_id: int) -> bool:
         normalized_update_id = int(update_id)
         try:
-            self._client.table("processed_updates").insert(
-                {"update_id": normalized_update_id}
-            ).execute()
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    "insert into public.processed_updates (update_id) values (%s)",
+                    (normalized_update_id,),
+                )
             return True
-        except APIError as exc:  # type: ignore[misc]
+        except Exception as exc:
             if _is_missing_table_error(exc, table_name="processed_updates"):
                 self._warn_missing_processed_updates_once()
                 return False
@@ -536,15 +454,18 @@ class Database:
     def is_update_processed(self, update_id: int) -> bool:
         normalized_update_id = int(update_id)
         try:
-            response = (
-                self._client.table("processed_updates")
-                .select("update_id")
-                .eq("update_id", normalized_update_id)
-                .limit(1)
-                .execute()
-            )
-            return _first_row(response.data) is not None
-        except APIError as exc:  # type: ignore[misc]
+            with self._conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select 1
+                    from public.processed_updates
+                    where update_id = %s
+                    limit 1
+                    """,
+                    (normalized_update_id,),
+                )
+                return _fetchone_row(cur) is not None
+        except Exception as exc:
             if _is_missing_table_error(exc, table_name="processed_updates"):
                 self._warn_missing_processed_updates_once()
                 return False
@@ -556,319 +477,223 @@ class Database:
         self._processed_updates_missing_logged = True
         logger.warning(
             "processed_updates table is missing; update idempotency is disabled. "
-            "Run the latest Supabase schema/migration."
+            "Run the latest PostgreSQL schema/migration."
         )
 
-    # ---------- Backward-compatible wrappers (legacy handlers) ----------
-    def insert_ledger_entry(self, entry: LedgerEntry) -> bool:
-        profile = self._get_profile_by_telegram_user_id(entry.user_id)
-        if profile is None:
-            logger.warning("No profile found for telegram_user_id=%s", entry.user_id)
-            return False
+    # ---------- Internal ----------
+    def _get_payment_request_by_code_tx(
+        self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        code: str,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any] | None:
+        suffix = " for update" if for_update else ""
+        cur.execute(
+            (
+                "select * from public.payment_requests "
+                "where code = %s "
+                "limit 1"
+                f"{suffix}"
+            ),
+            (code,),
+        )
+        return _fetchone_row(cur)
 
-        friendship = self._get_any_accepted_friendship(str(profile["id"]))
-        if friendship is None:
-            logger.warning("No accepted friendship found for profile_id=%s", profile["id"])
-            return False
+    def _get_transaction_by_id_tx(
+        self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        tx_id: str,
+    ) -> dict[str, Any] | None:
+        if not tx_id:
+            return None
+        cur.execute(
+            """
+            select *
+            from public.transactions
+            where id = %s::uuid
+            limit 1
+            """,
+            (_normalize_uuid(tx_id),),
+        )
+        return _fetchone_row(cur)
 
-        try:
-            self.create_pending_transaction(
-                friendship_id=str(friendship["id"]),
-                created_by=str(profile["id"]),
-                direction=entry.direction,
-                amount=entry.amount,
-                currency=entry.currency,
-                note=entry.note,
+    def _ensure_accepted_friendship_tx(
+        self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        *,
+        left_id: str,
+        right_id: str,
+        invited_by: str,
+    ) -> dict[str, Any]:
+        invited_by = _normalize_uuid(invited_by)
+        user_low, user_high = _canonical_pair(left_id, right_id)
+
+        cur.execute(
+            """
+            insert into public.friendships (
+                user_low,
+                user_high,
+                status,
+                invited_by,
+                accepted_at
             )
-        except Exception:
-            logger.exception("Failed to insert legacy ledger entry")
-            return False
-
-        return True
-
-    def get_ledger_entries(self, *, user_id: int, chat_id: int, limit: int = 50) -> list[LedgerEntry]:
-        del chat_id  # chat_id is not part of the normalized relational model.
-
-        profile = self._get_profile_by_telegram_user_id(user_id)
-        if profile is None:
-            return []
-
-        response = (
-            self._client.table("transactions")
-            .select("id,amount,currency,direction,note,created_at")
-            .eq("created_by", str(profile["id"]))
-            .order("created_at", desc=True)
-            .limit(max(1, min(int(limit), 200)))
-            .execute()
+            values (%s::uuid, %s::uuid, 'accepted', %s::uuid, now())
+            on conflict (user_low, user_high)
+            do update set
+                status = 'accepted',
+                accepted_at = coalesce(public.friendships.accepted_at, excluded.accepted_at),
+                invited_by = excluded.invited_by
+            returning *
+            """,
+            (user_low, user_high, invited_by),
         )
-
-        entries: list[LedgerEntry] = []
-        for row in _rows(response.data):
-            amount = _to_decimal(row.get("amount"))
-            created_at = _parse_datetime(row.get("created_at"))
-            direction = str(row.get("direction", "out")).lower()
-            if direction not in {"in", "out"}:
-                direction = "out"
-
-            entries.append(
-                LedgerEntry(
-                    user_id=user_id,
-                    chat_id=0,
-                    amount=amount,
-                    currency=str(row.get("currency", "ILS")).upper(),
-                    direction=direction,
-                    note=str(row.get("note", "")).strip(),
-                    id=None,
-                    created_at=created_at,
-                )
-            )
-
-        return entries
-
-    def get_friends(self, *, user_id: int, chat_id: int, limit: int = 20) -> list[FriendRecord]:
-        profile = self._get_profile_by_telegram_user_id(user_id)
-        if profile is None:
-            return []
-
-        items = self.list_friends(str(profile["id"]))
-        records: list[FriendRecord] = []
-        for item in items[: max(1, limit)]:
-            friend_profile = item.get("friend_profile") or {}
-            username = str(friend_profile.get("telegram_username", "")).strip()
-            if not username:
-                continue
-
-            records.append(
-                FriendRecord(
-                    user_id=user_id,
-                    chat_id=chat_id,
-                    friend_username=username,
-                )
-            )
-
-        return records
-
-    # ---------- Internal helpers ----------
-    def _get_profile_by_telegram_user_id(self, telegram_user_id: int) -> dict[str, Any] | None:
-        response = (
-            self._client.table("profiles")
-            .select("*")
-            .eq("telegram_user_id", int(telegram_user_id))
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
-
-    def _get_friendship_by_pair(self, user_low: str, user_high: str) -> dict[str, Any] | None:
-        response = (
-            self._client.table("friendships")
-            .select("*")
-            .eq("user_low", user_low)
-            .eq("user_high", user_high)
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
-
-    def _get_friendship_by_id(self, friendship_id: str) -> dict[str, Any] | None:
-        response = (
-            self._client.table("friendships")
-            .select("*")
-            .eq("id", _normalize_uuid(friendship_id))
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
-
-    def _get_transaction_by_id(self, tx_id: str) -> dict[str, Any] | None:
-        response = (
-            self._client.table("transactions")
-            .select("*")
-            .eq("id", _normalize_uuid(tx_id))
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
-
-    def _list_friendships_for_user(self, user_id: str) -> list[dict[str, Any]]:
-        response = (
-            self._client.table("friendships")
-            .select("*")
-            .eq("status", "accepted")
-            .or_(f"user_low.eq.{user_id},user_high.eq.{user_id}")
-            .execute()
-        )
-        return _rows(response.data)
-
-    def _get_profiles_by_id(self, profile_ids: set[str]) -> dict[str, dict[str, Any]]:
-        if not profile_ids:
-            return {}
-
-        response = (
-            self._client.table("profiles")
-            .select("id,telegram_user_id,telegram_username,display_name,default_currency")
-            .in_("id", sorted(profile_ids))
-            .execute()
-        )
-
-        return {
-            str(row.get("id")): row
-            for row in _rows(response.data)
-            if row.get("id") is not None
-        }
-
-    def _get_balances_by_friendship(self, friendship_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
-        if not friendship_ids:
-            return {}
-
-        response = (
-            self._client.table("balances")
-            .select("friendship_id,currency,net_amount")
-            .in_("friendship_id", friendship_ids)
-            .execute()
-        )
-
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for row in _rows(response.data):
-            friendship_id = str(row.get("friendship_id", ""))
-            if not friendship_id:
-                continue
-            grouped.setdefault(friendship_id, []).append(row)
-
-        return grouped
-
-    def _get_any_accepted_friendship(self, user_id: str) -> dict[str, Any] | None:
-        response = (
-            self._client.table("friendships")
-            .select("*")
-            .eq("status", "accepted")
-            .or_(f"user_low.eq.{user_id},user_high.eq.{user_id}")
-            .limit(1)
-            .execute()
-        )
-        return _first_row(response.data)
-
-    def _recompute_and_upsert_balance(self, friendship_id: str, currency: str) -> dict[str, Any]:
-        friendship_id = _normalize_uuid(friendship_id)
-        normalized_currency = _normalize_currency(currency)
-
-        friendship = self._get_friendship_by_id(friendship_id)
-        if friendship is None:
-            raise RuntimeError(f"Friendship not found: {friendship_id}")
-
-        response = (
-            self._client.table("transactions")
-            .select("created_by,direction,amount")
-            .eq("friendship_id", friendship_id)
-            .eq("status", "confirmed")
-            .eq("currency", normalized_currency)
-            .execute()
-        )
-
-        net = _ZERO
-        for tx in _rows(response.data):
-            net += _transaction_effect_on_net(tx=tx, friendship=friendship)
-
-        payload = {
-            "friendship_id": friendship_id,
-            "currency": normalized_currency,
-            "net_amount": _decimal_to_str(net),
-        }
-
-        upsert_response = (
-            self._client.table("balances")
-            .upsert(payload, on_conflict="friendship_id,currency")
-            .execute()
-        )
-        row = _first_row(upsert_response.data)
+        row = _fetchone_row(cur)
         if row is None:
-            raise RuntimeError("Failed to upsert balance")
+            raise RuntimeError("Failed to create or fetch friendship")
         return row
 
-    def _apply_balance_delta(
+    def _create_confirmed_transaction_tx(
         self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        *,
+        friendship: Mapping[str, Any],
+        friendship_id: str,
+        created_by: str,
+        direction: str,
+        amount: Decimal,
+        currency: str,
+        confirmed_by: str,
+        note: str | None,
+    ) -> dict[str, Any]:
+        friendship_id = _normalize_uuid(friendship_id)
+        created_by = _normalize_uuid(created_by)
+        confirmed_by = _normalize_uuid(confirmed_by)
+
+        direction = direction.strip().lower()
+        if direction not in {"in", "out"}:
+            raise ValueError("Invalid direction")
+
+        members = {
+            str(friendship.get("user_low", "")),
+            str(friendship.get("user_high", "")),
+        }
+        if created_by not in members:
+            raise ValueError("Transaction creator must belong to friendship")
+        if confirmed_by not in members:
+            raise ValueError("Confirmer must belong to friendship")
+
+        cur.execute(
+            """
+            insert into public.transactions (
+                friendship_id,
+                created_by,
+                direction,
+                amount,
+                currency,
+                note,
+                status,
+                confirmed_by,
+                confirmed_at,
+                rejected_at,
+                reversed_at,
+                reverses_transaction_id
+            )
+            values (
+                %s::uuid,
+                %s::uuid,
+                %s,
+                %s,
+                %s,
+                %s,
+                'confirmed',
+                %s::uuid,
+                now(),
+                null,
+                null,
+                null
+            )
+            returning *
+            """,
+            (
+                friendship_id,
+                created_by,
+                direction,
+                _decimal_to_str(_normalize_amount(amount)),
+                normalize_currency_code(currency),
+                _normalize_text(note),
+                confirmed_by,
+            ),
+        )
+        row = _fetchone_row(cur)
+        if row is None:
+            raise RuntimeError("Failed to create transaction")
+
+        delta = _transaction_effect_on_net(tx=row, friendship=friendship)
+        balance_row = self._apply_balance_delta_tx(
+            cur,
+            friendship_id=str(row.get("friendship_id", "")),
+            currency=str(row.get("currency", "")),
+            delta=delta,
+        )
+        if balance_row is not None:
+            row["net_amount_after"] = balance_row.get("net_amount")
+
+        return row
+
+    def _get_balance_row_tx(
+        self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        friendship_id: str,
+        currency: str,
+    ) -> dict[str, Any] | None:
+        cur.execute(
+            """
+            select friendship_id, currency, net_amount
+            from public.balances
+            where friendship_id = %s::uuid
+              and currency = %s
+            limit 1
+            """,
+            (_normalize_uuid(friendship_id), normalize_currency_code(currency)),
+        )
+        return _fetchone_row(cur)
+
+    def _apply_balance_delta_tx(
+        self,
+        cur: psycopg.Cursor[dict[str, Any]],
+        *,
         friendship_id: str,
         currency: str,
         delta: Decimal | str | int | float,
     ) -> dict[str, Any] | None:
-        """
-        Apply a delta to balances.net_amount with optimistic compare-and-set retries.
-        """
-        friendship_id = _normalize_uuid(friendship_id)
-        normalized_currency = _normalize_currency(currency)
+        normalized_friendship_id = _normalize_uuid(friendship_id)
+        normalized_currency = normalize_currency_code(currency)
         normalized_delta = _to_decimal(delta)
 
         if normalized_delta == _ZERO:
-            return self._get_balance_row(friendship_id, normalized_currency)
+            return self._get_balance_row_tx(cur, normalized_friendship_id, normalized_currency)
 
-        for _ in range(8):
-            current_row = self._get_balance_row(friendship_id, normalized_currency)
-            if current_row is None:
-                payload = {
-                    "friendship_id": friendship_id,
-                    "currency": normalized_currency,
-                    "net_amount": _decimal_to_str(normalized_delta),
-                }
-                try:
-                    inserted = self._client.table("balances").insert(payload).execute()
-                except APIError as exc:  # type: ignore[misc]
-                    if _is_unique_violation(exc):
-                        continue
-                    raise
-
-                row = _first_row(inserted.data)
-                if row is not None:
-                    return row
-                continue
-
-            current = _to_decimal(current_row.get("net_amount"))
-            target = current + normalized_delta
-            response = (
-                self._client.table("balances")
-                .update({"net_amount": _decimal_to_str(target)})
-                .eq("friendship_id", friendship_id)
-                .eq("currency", normalized_currency)
-                .eq("net_amount", _decimal_to_str(current))
-                .execute()
-            )
-            row = _first_row(response.data)
-            if row is not None:
-                return row
-
-        # Final correctness fallback if heavy contention occurs.
-        return self._recompute_and_upsert_balance(friendship_id, normalized_currency)
-
-    def _get_balance_row(self, friendship_id: str, currency: str) -> dict[str, Any] | None:
-        response = (
-            self._client.table("balances")
-            .select("friendship_id,currency,net_amount")
-            .eq("friendship_id", _normalize_uuid(friendship_id))
-            .eq("currency", _normalize_currency(currency))
-            .limit(1)
-            .execute()
+        cur.execute(
+            """
+            insert into public.balances (friendship_id, currency, net_amount)
+            values (%s::uuid, %s, %s)
+            on conflict (friendship_id, currency)
+            do update set
+                net_amount = public.balances.net_amount + excluded.net_amount
+            returning friendship_id, currency, net_amount
+            """,
+            (
+                normalized_friendship_id,
+                normalized_currency,
+                _decimal_to_str(normalized_delta),
+            ),
         )
-        return _first_row(response.data)
-
-
-def _validate_tx_reviewer(
-    friendship: Mapping[str, Any],
-    tx_created_by: str,
-    reviewer_id: str,
-) -> None:
-    members = {
-        str(friendship.get("user_low", "")),
-        str(friendship.get("user_high", "")),
-    }
-    if reviewer_id not in members:
-        raise ValueError("Reviewer is not a member of this friendship")
-    if reviewer_id == tx_created_by:
-        raise ValueError("Creator cannot confirm/reject their own transaction")
+        return _fetchone_row(cur)
 
 
 def _transaction_effect_on_net(tx: Mapping[str, Any], friendship: Mapping[str, Any]) -> Decimal:
     """
-    Returns transaction impact on balances.net_amount.
-
     balances.net_amount > 0 means user_high owes user_low.
     """
     amount = _to_decimal(tx.get("amount"))
@@ -886,21 +711,18 @@ def _transaction_effect_on_net(tx: Mapping[str, Any], friendship: Mapping[str, A
     if created_by == user_low:
         return amount if direction == "out" else -amount
 
-    # created_by == user_high
     return -amount if direction == "out" else amount
 
 
-def _rows(data: Any) -> list[dict[str, Any]]:
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict):
-        return [data]
-    return []
+def _fetchone_row(cur: psycopg.Cursor[dict[str, Any]]) -> dict[str, Any] | None:
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return dict(row)
 
 
-def _first_row(data: Any) -> dict[str, Any] | None:
-    rows = _rows(data)
-    return rows[0] if rows else None
+def _fetchall_rows(cur: psycopg.Cursor[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [dict(row) for row in cur.fetchall()]
 
 
 def _normalize_uuid(value: str | UUID) -> str:
@@ -929,10 +751,6 @@ def _normalize_text(value: str | None) -> str | None:
     return normalized if normalized else None
 
 
-def _normalize_currency(currency: str) -> str:
-    return normalize_currency_code(currency)
-
-
 def _normalize_amount(value: Decimal | str | int | float) -> Decimal:
     try:
         amount = Decimal(str(value)).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
@@ -955,84 +773,20 @@ def _decimal_to_str(value: Decimal) -> str:
     return str(value.quantize(_TWO_DP, rounding=ROUND_HALF_UP))
 
 
-def _parse_datetime(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return None
-
-    iso_value = value.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(iso_value)
-    except ValueError:
-        return None
-
-
-def _to_iso_datetime(value: datetime | str | None) -> str:
-    if value is None:
-        return _now_utc_iso()
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat()
-
-    parsed = _parse_datetime(value)
-    if parsed is None:
-        return _now_utc_iso()
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat()
-
-
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _generate_invite_code() -> str:
-    return "".join(secrets.choice(_INVITE_CODE_ALPHABET) for _ in range(_INVITE_CODE_LENGTH))
-
-
-def _extract_api_error_message(exc: Exception) -> str:
-    raw_message = getattr(exc, "message", None)
-    if isinstance(raw_message, str):
-        cleaned = raw_message.strip()
-        if cleaned and cleaned.lower() != "json could not be generated":
-            return cleaned
-
-    raw_details = getattr(exc, "details", None)
-    if isinstance(raw_details, str) and raw_details.strip():
-        details = raw_details.strip()
-        match = re.search(r"Invalid API key", details, flags=re.IGNORECASE)
-        if match:
-            return "Invalid API key"
-        return details
-
-    text = str(exc).strip()
-    if not text:
-        return "Unknown Supabase API error"
-
-    match = re.search(r"Invalid API key", text, flags=re.IGNORECASE)
-    if match:
-        return "Invalid API key"
-    return text
+def _generate_code() -> str:
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(_CODE_LENGTH))
 
 
 def _is_unique_violation(exc: Exception) -> bool:
-    code = getattr(exc, "code", None)
-    if str(code) == "23505":
-        return True
-
-    message = str(exc).lower()
-    return "duplicate key value violates unique constraint" in message or "23505" in message
+    return str(getattr(exc, "sqlstate", "")).upper() == "23505"
 
 
 def _is_missing_table_error(exc: Exception, *, table_name: str) -> bool:
-    code = str(getattr(exc, "code", "")).upper()
-    if code == "PGRST205":
+    if str(getattr(exc, "sqlstate", "")).upper() == "42P01":
         return True
 
     message = str(exc).lower()
     return (
-        f"could not find the table 'public.{table_name.lower()}'" in message
-        or f"relation \"{table_name.lower()}\" does not exist" in message
+        f"relation \"{table_name.lower()}\" does not exist" in message
+        or f"relation \"public.{table_name.lower()}\" does not exist" in message
     )
