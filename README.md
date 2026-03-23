@@ -98,6 +98,8 @@ python -m bot.setup_webhook
 
 This command uses `PUBLIC_BASE_URL` and `WEBHOOK_SECRET` from your environment and registers the webhook URL `https://<your-domain>/api/telegram`.
 
+If your Vercel storage integration injects `POSTGRES_URL` instead of `DATABASE_URL`, the app accepts that too.
+
 ## Database note
 
 This version requires table `payment_requests` and `processed_updates` from `postgres/schema.sql`.

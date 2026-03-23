@@ -11,13 +11,14 @@ from .currency import normalize_currency_code
 class Settings(BaseSettings):
     BOT_TOKEN: SecretStr = Field(..., min_length=10)
     BOT_USERNAME: str | None = Field(default=None)
-    DATABASE_URL: SecretStr = Field(..., min_length=1)
+    DATABASE_URL: SecretStr | None = Field(default=None, min_length=1)
+    POSTGRES_URL: SecretStr | None = Field(default=None, min_length=1)
     DEFAULT_CURRENCY: str = Field(default="ILS", min_length=3, max_length=3)
     WEBHOOK_SECRET: SecretStr | None = Field(default=None, min_length=1)
     PUBLIC_BASE_URL: str | None = Field(default=None)
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -57,7 +58,11 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return self.DATABASE_URL.get_secret_value()
+        if self.DATABASE_URL is not None:
+            return self.DATABASE_URL.get_secret_value()
+        if self.POSTGRES_URL is not None:
+            return self.POSTGRES_URL.get_secret_value()
+        raise RuntimeError("DATABASE_URL or POSTGRES_URL is required")
 
     @property
     def webhook_secret(self) -> str | None:

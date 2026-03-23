@@ -22,6 +22,16 @@ class WebhookConfigTest(unittest.TestCase):
         self.assertEqual(settings.public_base_url, "https://example.com")
         self.assertEqual(settings.telegram_webhook_url, "https://example.com/api/telegram")
 
+    def test_database_url_falls_back_to_postgres_url(self) -> None:
+        settings = make_settings(
+            DATABASE_URL=None,
+            POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/fallback_db",
+        )
+        self.assertEqual(
+            settings.database_url,
+            "postgresql://postgres:postgres@localhost:5432/fallback_db",
+        )
+
     def test_webhook_secret_is_optional(self) -> None:
         settings = make_settings()
         self.assertTrue(_is_valid_telegram_secret(settings, None))
