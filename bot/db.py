@@ -7,8 +7,12 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Mapping
 from uuid import UUID
 
-import psycopg
-from psycopg.rows import dict_row
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover - exercised only in runtimes without psycopg support
+    psycopg = None  # type: ignore[assignment]
+    dict_row = None  # type: ignore[assignment]
 
 from .config import Settings
 from .currency import normalize_currency_code
@@ -19,10 +23,18 @@ _CODE_ALPHABET = string.ascii_uppercase + string.digits
 _CODE_LENGTH = 10
 _TWO_DP = Decimal("0.01")
 _ZERO = Decimal("0.00")
+_POSTGRES_DRIVER_UNAVAILABLE_MESSAGE = (
+    "PostgreSQL access is unavailable in this runtime. "
+    "This bot currently uses a direct psycopg connection, which is not compatible with "
+    "Cloudflare Python Workers. Use Cloudflare Containers or move database access behind "
+    "an HTTP/service boundary."
+)
 
 
 class Database:
     def __init__(self, settings: Settings) -> None:
+        if psycopg is None or dict_row is None:
+            raise RuntimeError(_POSTGRES_DRIVER_UNAVAILABLE_MESSAGE)
         self._conn = psycopg.connect(
             conninfo=settings.database_url,
             autocommit=True,

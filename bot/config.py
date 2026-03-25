@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Any
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -81,6 +82,28 @@ class Settings(BaseSettings):
         return f"{self.PUBLIC_BASE_URL}/api/telegram"
 
 
+def _worker_settings_overrides() -> dict[str, Any]:
+    try:
+        from workers import env as worker_env  # type: ignore[import-not-found]
+    except Exception:
+        return {}
+
+    overrides: dict[str, Any] = {}
+    for field_name in Settings.model_fields:
+        value = getattr(worker_env, field_name, None)
+        if value is not None:
+            overrides[field_name] = value
+
+    return overrides
+
+
 @lru_cache(maxsize=1)
-def get_settings() -> Settings:
+def _get_local_settings() -> Settings:
     return Settings()
+
+
+def get_settings() -> Settings:
+    worker_overrides = _worker_settings_overrides()
+    if worker_overrides:
+        return Settings(**worker_overrides)
+    return _get_local_settings()

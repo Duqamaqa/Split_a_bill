@@ -101,6 +101,33 @@ This command uses `PUBLIC_BASE_URL` and `WEBHOOK_SECRET` from your environment a
 
 If your Vercel storage integration injects `POSTGRES_URL` instead of `DATABASE_URL`, the app accepts that too.
 
+## Cloudflare Workers
+
+The repo now includes the minimum Worker files that Wrangler expects:
+- `wrangler.toml`
+- `pyproject.toml`
+- `src/entry.py`
+
+Use Cloudflare's Python Worker flow:
+
+```bash
+uv run pywrangler dev
+uv run pywrangler deploy
+```
+
+Set your runtime config as Worker bindings:
+- secrets: `BOT_TOKEN`, `WEBHOOK_SECRET`, `DATABASE_URL` or `POSTGRES_URL`
+- vars or secrets: `BOT_USERNAME`, `PUBLIC_BASE_URL`, `DEFAULT_CURRENCY`
+
+Important limitation:
+
+Cloudflare's Python Workers support FastAPI, but this repo's current database layer uses a direct `psycopg` PostgreSQL connection. Cloudflare's Python runtime only supports pure-Python or Pyodide-supported packages, and Python `sockets` are not functional there. That means this repo cannot use PostgreSQL on Python Workers as-is.
+
+Practical options if you want to stay on Cloudflare:
+- Move the app to Cloudflare Containers and keep the current PostgreSQL client.
+- Move PostgreSQL access behind an HTTP/service layer and let the Worker call that service.
+- Rewrite the data layer to use a Cloudflare-compatible storage/binding strategy.
+
 ## Database note
 
 This version requires table `payment_requests` and `processed_updates` from `postgres/schema.sql`.
