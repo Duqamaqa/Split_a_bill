@@ -1,133 +1,88 @@
-# Split a Bill Telegram Bot
+# Split a Bill
 
-Minimal Telegram debt bot with exactly 3 user actions:
-- `In`
-- `Balance`
-- `Close`
+### A Telegram prototype for recording and confirming personal debts.
 
-Tech stack:
-- aiogram v3
-- FastAPI webhook entrypoint for Vercel
-- PostgreSQL (direct via psycopg)
-- pydantic-settings
+[![Tests](https://github.com/Duqamaqa/Split_a_bill/actions/workflows/tests.yml/badge.svg)](https://github.com/Duqamaqa/Split_a_bill/actions/workflows/tests.yml)
 
-## How it works
+Record money you received, share an approval link with the other person, and view outstanding balances. The interaction centers on three actions: **In**, **Balance**, and **Close**.
 
-1. User taps `In`.
-2. Bot asks for amount (`120` or `120 USD`).
-3. Bot creates a deep link like `https://t.me/<BOT_USERNAME>?start=pay_<CODE>`.
-4. User taps `Forward Loan` and sends it to the person who gave the money.
-5. That person opens the link and taps `Approve`.
-6. Bot writes a confirmed transaction to PostgreSQL.
+**Python 3.12+ · aiogram 3 · FastAPI · PostgreSQL**
 
-`Balance` shows only non-zero debts.
+[User flow](BOT_FULL_DESCRIPTION.md) · [Architecture](docs/ARCHITECTURE.md) · [Deployment](docs/DEPLOYMENT.md) · [Validation](docs/VALIDATION.md)
 
-`Close` shows people with open debts as buttons. Tapping a person sets your mutual balances to `0`.
+## The flow
 
-## Requirements
-
-- Python 3.12+
-- `pip`
-- PostgreSQL 14+
-
-## Local setup
-
-1. Open terminal in the project:
-
-```bash
-cd /Users/coconut/Documents/projects/Split_a_bill
+```mermaid
+sequenceDiagram
+    participant A as Borrower
+    participant B as Telegram bot
+    participant C as Other person
+    participant D as PostgreSQL
+    A->>B: In — 120 USD
+    B-->>A: Shareable approval link
+    A->>C: Forward link
+    C->>B: Approve
+    B->>D: Record confirmed transaction
+    A->>B: Balance
+    B-->>A: Outstanding balances
 ```
 
-2. Create and activate a virtual environment:
+`Close` records closure of mutual balances with a selected person. It does not transfer money or prove that repayment happened outside the bot.
+
+## Run locally
+
+You need Python 3.12+, PostgreSQL 14+, and a Telegram bot token. Use a development bot and demonstration data when evaluating the project.
 
 ```bash
-python3.12 -m venv .venv
+git clone https://github.com/Duqamaqa/Split_a_bill.git
+cd Split_a_bill
+python3 -m venv .venv
 source .venv/bin/activate
-```
-
-3. Install dependencies:
-
-```bash
 pip install -r requirements.txt
-```
-
-4. Create env file:
-
-```bash
 cp .env.example .env
 ```
 
-5. Fill `.env`:
+Set `BOT_TOKEN`, `BOT_USERNAME`, and `DATABASE_URL` in `.env`. `DEFAULT_CURRENCY` defaults to `ILS`. Keep credentials out of commits and screenshots.
 
-```env
-BOT_TOKEN=<telegram-bot-token>
-BOT_USERNAME=<bot_username_without_@>
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/split_bill
-DEFAULT_CURRENCY=ILS
-WEBHOOK_SECRET=<random-secret-string>
-PUBLIC_BASE_URL=https://your-project.vercel.app
-```
+Create the database schema using [postgres/schema.sql](postgres/schema.sql). The checked-in migration is for existing databases that need the payment-request tables; review your database state before applying it.
 
-6. Run SQL in PostgreSQL:
-
-- `postgres/schema.sql`
-- If you already have old tables and only need request-links feature:
-  - `postgres/migrations/20260306_payment_requests.sql`
-
-7. Optional local polling mode for development:
+Start polling:
 
 ```bash
 python -m bot.main
 ```
 
-## Vercel deployment
+For hosted webhook operation, follow [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). **The Cloudflare Python Worker scaffold does not support this application's current direct PostgreSQL connection as-is.**
 
-The Vercel Python function entrypoint is `api/index.py`.
-It exposes:
-- `POST /api/telegram` for Telegram webhooks
-- `GET /api/health` for a database-backed health check
+## Inspect the implementation
 
-Project files added for Vercel:
-- `api/index.py`
-- `.python-version`
+| Concern | Source |
+| --- | --- |
+| User actions and amount parsing | [bot/handlers/simple.py](bot/handlers/simple.py) |
+| Database operations and Decimal amounts | [bot/db.py](bot/db.py) |
+| Schema and migration | [postgres](postgres) |
+| Webhook and health routes | [bot/webhook_app.py](bot/webhook_app.py) |
+| Environment settings | [bot/config.py](bot/config.py) |
+| Duplicate-update handling | [bot/middlewares/idempotency.py](bot/middlewares/idempotency.py) |
 
-After deployment, set the Telegram webhook with:
+## Run the tests
 
-```bash
-python -m bot.setup_webhook
-```
-
-This command uses `PUBLIC_BASE_URL` and `WEBHOOK_SECRET` from your environment and registers the webhook URL `https://<your-domain>/api/telegram`.
-
-If your Vercel storage integration injects `POSTGRES_URL` instead of `DATABASE_URL`, the app accepts that too.
-
-## Cloudflare Workers
-
-The repo now includes the minimum Worker files that Wrangler expects:
-- `wrangler.toml`
-- `pyproject.toml`
-- `src/entry.py`
-
-Use Cloudflare's Python Worker flow:
+With the dependencies installed:
 
 ```bash
-uv run pywrangler dev
-uv run pywrangler deploy
+python -m unittest discover -s tests -v
 ```
 
-Set your runtime config as Worker bindings:
-- secrets: `BOT_TOKEN`, `WEBHOOK_SECRET`, `DATABASE_URL` or `POSTGRES_URL`
-- vars or secrets: `BOT_USERNAME`, `PUBLIC_BASE_URL`, `DEFAULT_CURRENCY`
+The existing ten tests cover amount parsing, balance labels, configuration, and webhook-secret matching. They do not require a real Telegram token or PostgreSQL connection. See the [validation record](docs/VALIDATION.md) and [CI workflow](.github/workflows/tests.yml).
 
-Important limitation:
+## Status and limitations
 
-Cloudflare's Python Workers support FastAPI, but this repo's current database layer uses a direct `psycopg` PostgreSQL connection. Cloudflare's Python runtime only supports pure-Python or Pyodide-supported packages, and Python `sockets` are not functional there. That means this repo cannot use PostgreSQL on Python Workers as-is.
+An AI-assisted portfolio prototype, developed with extensive AI assistance and not currently in active personal use. No maintained public bot endpoint or production service is promised.
 
-Practical options if you want to stay on Cloudflare:
-- Move the app to Cloudflare Containers and keep the current PostgreSQL client.
-- Move PostgreSQL access behind an HTTP/service layer and let the Worker call that service.
-- Rewrite the data layer to use a Cloudflare-compatible storage/binding strategy.
+- This tracks records of debts; it does not move money or integrate a payment processor.
+- Webhook-secret validation is optional in the current implementation. **Set a strong `WEBHOOK_SECRET` for any hosted webhook deployment.**
+- Duplicate-update tracking is not proof of exactly-once processing under concurrent delivery.
+- The existing tests do not cover database transactions, concurrent approvals, or a live Telegram conversation.
+- Python dependencies use version ranges; a future installation can resolve different versions.
 
-## Database note
-
-This version requires table `payment_requests` and `processed_updates` from `postgres/schema.sql`.
+These boundaries are part of the project, not claims hidden behind a passing test badge. Read the [architecture](docs/ARCHITECTURE.md) before adapting the prototype for real users.
