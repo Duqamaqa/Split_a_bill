@@ -222,14 +222,27 @@ def upload_public(path):
     """Host a local photo to get a public URL (needed by IG container)."""
     import subprocess
     for attempt in range(4):
-        out = subprocess.run(["curl", "-s", "-F", f"fileToUpload=@{path}", "-F", "reqtype=fileupload",
-                              "https://catbox.moe/user/api.php"], capture_output=True, text=True, timeout=60).stdout.strip()
+        try:
+            out = subprocess.run(["curl", "-s", "-m", "55", "-F", f"fileToUpload=@{path}", "-F", "reqtype=fileupload",
+                                  "https://catbox.moe/user/api.php"], capture_output=True, text=True, timeout=60).stdout.strip()
+        except subprocess.TimeoutExpired:
+            out = ""
         if out.startswith("http"):
             # verify catbox actually serves the file (it has been returning 0-byte responses)
-            v = subprocess.run(["curl", "-sL", "-o", "/dev/null", "-w", "%{size_download}", out],
+            v = subprocess.run(["curl", "-sL", "-m", "55", "-o", "/dev/null", "-w", "%{size_download}", out],
                                capture_output=True, text=True, timeout=60).stdout.strip()
             if v.isdigit() and int(v) > 5000: return out
         time.sleep(20 * (attempt + 1))  # catbox rate-limits rapid repeated uploads
+    # fallback host (catbox was down Oct 22 2026): uguu.se, files valid 3h - enough for same-day approval+publish
+    try:
+        out = subprocess.run(["curl", "-sk", "-m", "90", "-F", f"files[]=@{path}",
+                              "https://uguu.se/upload?output=text"], capture_output=True, text=True, timeout=120).stdout.strip()
+        if out.startswith("http"):
+            v = subprocess.run(["curl", "-sL", "-m", "55", "-o", "/dev/null", "-w", "%{size_download}", out],
+                               capture_output=True, text=True, timeout=60).stdout.strip()
+            if v.isdigit() and int(v) > 5000: return out
+    except Exception:
+        pass
     return None
 
 def daily():
@@ -471,7 +484,7 @@ def publish(caption, image_urls):
 
 def subprocess_run(cmd):
     import subprocess
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
                        env={**os.environ, "OUT": "/tmp/posts_metrics.json"})
     if r.returncode != 0:
         raise RuntimeError(r.stderr[-500:])
