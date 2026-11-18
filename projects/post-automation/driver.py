@@ -43,8 +43,13 @@ API = "https://graph.facebook.com/v21.0"
 def tg(method, **kw):
     data = urllib.parse.urlencode(kw).encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{BOT}/{method}", data=data)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try: detail = e.read().decode(errors="replace")
+        except Exception: detail = ""
+        raise RuntimeError(f"{method} HTTP {e.code}: {detail}") from None
 
 def send_draft(caption, image_urls, state_extra=None):
     if isinstance(image_urls, str): image_urls = [image_urls]
@@ -119,9 +124,9 @@ def send_draft(caption, image_urls, state_extra=None):
             if len(tmps) == 1:
                 import uuid
                 b = uuid.uuid4().hex
-                body = f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{GROUP}\r\n"
-                body += f"--{b}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:1024]}\r\n"
-                body += f"--{b}\r\nContent-Disposition: form-data; name=\"reply_markup\"\r\n\r\n{json.dumps(kb)}\r\n"
+                body = f"--{b}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{GROUP}\r\n".encode()
+                body += f"--{b}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:1024]}\r\n".encode()
+                body += f"--{b}\r\nContent-Disposition: form-data; name=\"reply_markup\"\r\n\r\n{json.dumps(kb)}\r\n".encode()
                 body += f"--{b}\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".encode()
                 with open(tmps[0], "rb") as f: raw = f.read()
                 body += raw + f"\r\n--{b}--\r\n".encode()
